@@ -250,12 +250,12 @@ class TensorboardLogReader(  # ...
     return self.Context()
 
   # Helper function
-  def _extract_scalar_from_proto(self, value, step):
+  def _extract_scalar_from_proto(self, value, step, walltime):
     from tensorboard.compat.tensorflow_stub.dtypes import DType
 
     if value.HasField('simple_value'):  # v1
       simple_value = value.simple_value
-      yield step, value.tag, simple_value
+      yield step, value.tag, simple_value, walltime
 
     elif value.HasField('metadata'):  # v2 eventfile
       plugin_name = None
@@ -269,7 +269,7 @@ class TensorboardLogReader(  # ...
             simple_value = t.float_val[0]
           else:
             simple_value = np.frombuffer(t.tensor_content, dtype=dtype)[0]
-          yield step, value.tag, simple_value
+          yield step, value.tag, simple_value, walltime
 
   def _iter_scalar_summary_from(self, event_file, *,
                                 skip=0, limit=None,  # per event_file
@@ -298,12 +298,13 @@ class TensorboardLogReader(  # ...
     rows_read = 0
 
     for event in summary_iterator(event_file, skip=skip):
+      walltime = event.wall_time
       rows_read += 1
       step = int(event.step)
       if not event.HasField('summary'):
         continue
       for value in event.summary.value:
-        yield from self._extract_scalar_from_proto(value, step=step)
+        yield from self._extract_scalar_from_proto(value, step=step, walltime=walltime)
 
     rows_callback(rows_read)
 
@@ -320,7 +321,7 @@ class TensorboardLogReader(  # ...
         context.rows_read.update({event_file: rows_read})
         context.last_read_rows += rows_read
 
-      for global_step, tag_name, value in \
+      for global_step, tag_name, value, walltime in \
           self._iter_scalar_summary_from(
               event_file, skip=context.rows_read[event_file],
               rows_callback=_callback,
@@ -328,6 +329,10 @@ class TensorboardLogReader(  # ...
         # Make sure global_step is always stored as integer.
         global_step = int(global_step)
         chunk[tag_name][global_step] = value
+        chunk["walltime_max"][global_step] = max(walltime, 
+                            chunk["walltime_max"].get(global_step, walltime-1))
+        chunk["walltime_min"][global_step] = min(walltime, 
+                            chunk["walltime_min"].get(global_step, walltime+1))
 
     df_chunk = pd.DataFrame(chunk)
     df_chunk.index.name = 'global_step'
@@ -555,7 +560,7 @@ def get_runs_serial(*path_globs,
 def get_runs_parallel(
     *path_globs,
     verbose=False,
-    n_jobs=8,
+    n_jobs=1,
     pool_class=multiprocess.pool.Pool,
     progress_bar=True,
     run_postprocess_fn=None,
