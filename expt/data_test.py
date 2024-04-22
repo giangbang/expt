@@ -1,5 +1,6 @@
 """Tests for expt.data"""
 # pylint: disable=redefined-outer-name
+# pylint: disable=protected-access
 
 import itertools
 import re
@@ -59,6 +60,13 @@ def runs_gridsearch() -> RunList:
       run = Run(f"{algo}-{env_id}-seed{seed}", df)
       runs.append(run)
   return RunList(runs)
+
+
+def _runs_gridsearch_config_fn(r: Run):
+  config = {}
+  config['algo'], config['env_id'], config['seed'] = r.name.split('-')
+  config['common_hparam'] = 1
+  return config
 
 
 class TestRun(_TestBase):
@@ -433,13 +441,43 @@ class TestHypothesis(_TestBase):
     h: Hypothesis = self._fixture(named_index=True)
     assert h.columns == ['x', 'y', 'z']
     df = h.summary()
-
     print(df)
     assert len(df) == 1
     assert df['name'][0] == 'h'
     # the summary columns should include the name of index (`x`)
     # as well as other columns in the correct order
     assert list(df.columns) == ['name', 'x', 'y', 'z']
+    assert np.isnan(df['z']).all()
+
+    # (3) individual_runs mode
+    df = h.summary(individual_runs=True)
+    print(df)
+    assert len(df) == len(h.runs)
+    assert list(df.columns) == ['name', 'x', 'y', 'z']
+    # summary for each of the individual runs
+    # "x": [0, 2, 4, 6, 8]  or [1, 3, 5, 7, 9]
+    np.testing.assert_array_almost_equal(df['x'].values, [8, 9])
+    np.testing.assert_array_almost_equal(df['y'].values, [16, 19])
+    assert np.isnan(df['z']).all()
+
+  def test_resample(self):
+    h: Hypothesis = self._fixture()
+    h.config = {"kind": "resample"}
+
+    h2 = h.resample("x", n_samples=91)
+
+    # it should preserve other metadata (e.g., config)
+    assert h2.name == h.name
+    assert h2.config == h.config
+
+    # all the dataframes should have the same length
+    assert all(len(df) == 91 for df in h2._dataframes)
+
+    # non-numeric columns will be preserved.
+    # x is not a index but a normal column?
+    assert h2.columns == ['x', 'y', 'z']
+
+    # TODO: Errorneous case: when n_samples > #data points
 
   def test_interpolate(self):
     """Tests interpolate and subsampling when runs have different support."""
@@ -471,6 +509,10 @@ class TestHypothesis(_TestBase):
     np.testing.assert_allclose(
         np.array(dfs_interp[1].loc[dfs_interp[1].index >= 1, 'y']),
         np.array(dfs_interp[1].index[dfs_interp[1].index >= 1]) * 2 + 1)
+
+    # two individual runs now have the same support on the x-axis
+    assert dfs_interp[0].index.min() == dfs_interp[1].index.min() == 0.0
+    assert dfs_interp[0].index.max() == dfs_interp[1].index.max() == 9.0
 
     # it should preserve other metadata (e.g., config)
     assert h_interpolated.config == h.config
@@ -514,6 +556,19 @@ class TestHypothesis(_TestBase):
 
 class TestExperiment(_TestBase):
 
+  def test_create_simple(self):
+    ex = Experiment("only_name")
+    assert len(ex.hypotheses) == 0
+    assert ex.name == "only_name"
+
+    h = TestHypothesis._fixture()
+    ex = Experiment("one_hypo", [h])
+    assert len(ex.hypotheses) == 1
+    assert ex.name == "one_hypo"
+
+    assert ex._summary_columns is None
+    assert list(ex._df.columns) == ["hypothesis", "x", "y", "z"]
+
   def test_create_from_dataframe_run(self, runs_gridsearch: RunList):
     """Tests Experiment.from_dataframe with the minimal defaults."""
 
@@ -548,6 +603,9 @@ class TestExperiment(_TestBase):
     assert ex.name == "Exp.foobar"
     assert list(ex._df.index.names) == ['algo', 'name']  # Note the order
     # yapf: enable
+
+    # All other columns than by = "algo"
+    assert ex._summary_columns == ("env_id", "seed")
 
     # by: not exists?
     with pytest.raises(KeyError):  # TODO: Improve exception
@@ -594,8 +652,28 @@ class TestExperiment(_TestBase):
     assert 'hypothesis' in df.columns and 'run' not in df.columns
     assert df.shape[0] == 6  # 6 hypotheses
 
-    # default parameters
+    # use default parameters to create ex
     ex = V(Experiment.from_dataframe(df))
+    self._validate_ex_gridsearch(ex)
+
+    # an incorrect use of `by`?
+    with pytest.raises(ValueError, match='does not have a column'):
+      ex = Experiment.from_dataframe(df, by="algo")
+
+  def test_create_from_runs(self, runs_gridsearch: RunList):
+    """Tests Experiment.from_runs with the minimal defaults."""
+
+    # Uses default for config_keys: see varied_config_keys.
+    ex = Experiment.from_runs(
+        runs_gridsearch,
+        config_fn=_runs_gridsearch_config_fn,
+        name="ex_from_runs",
+    )
+    assert ex.name == "ex_from_runs"
+    assert ex._config_keys == ['algo', 'env_id']  # no 'common_hparam'
+    self._validate_ex_gridsearch(ex)
+
+  def _validate_ex_gridsearch(self, ex: Experiment):
     assert len(ex.hypotheses) == 6
     hypothesis_names = [
         # Note that the default hypothesis_namer is used
@@ -608,17 +686,25 @@ class TestExperiment(_TestBase):
     ]
     assert [ex.hypotheses[i].name for i in range(6)] == hypothesis_names
 
+    # Use custom name for some hypotheses
+    for h in ex.hypotheses:
+      assert h.config is not None
+      h.name = f"{h.config['algo']} ({h.config['env_id']})"
+
     # Because df already has a multi-index, so should ex.
     assert ex._df.index.names == ['algo', 'env_id', 'name']  # Note the order
-    assert list(ex._df.index.get_level_values('name')) == hypothesis_names
+    assert list(ex._df.index.get_level_values('name')) == [
+        'ppo (halfcheetah)',
+        'ppo (hopper)',
+        'ppo (humanoid)',
+        'sac (halfcheetah)',
+        'sac (hopper)',
+        'sac (humanoid)',
+    ]
     assert list(ex._df.index.get_level_values('algo')) == (  # ...
         ['ppo'] * 3 + ['sac'] * 3)
     assert list(ex._df.index.get_level_values('env_id')) == (
         ['halfcheetah', 'hopper', 'humanoid'] * 2)
-
-    # an incorrect use of `by`?
-    with pytest.raises(ValueError, match='does not have a column'):
-      ex = Experiment.from_dataframe(df, by="algo")
 
   def test_add_inplace(self, runs_gridsearch: RunList):
     """Tests Experiment.add_runs() and Experiment.add_hypothesis()."""
@@ -689,6 +775,54 @@ class TestExperiment(_TestBase):
       r = V(ex[['hyp1', 'hyp0'], 'a'])
     # pylint: enable=unsubscriptable-object
 
+  def test_with_config_keys(self, runs_gridsearch: RunList):
+    ex_base = Experiment.from_runs(
+        runs_gridsearch,
+        config_fn=_runs_gridsearch_config_fn,
+        config_keys=['algo', 'env_id', 'common_hparam'],
+    )
+
+    assert ex_base._config_keys == ['algo', 'env_id', 'common_hparam']
+    assert ex_base._df.index.get_level_values( \
+        'algo').tolist() == ['ppo', 'ppo', 'ppo', 'sac', 'sac', 'sac']
+    assert ex_base._df.index.get_level_values( \
+        'env_id').tolist() == ['halfcheetah', 'hopper', 'humanoid'] * 2
+
+    def validate_env_id_algo(ex):
+      assert ex._summary_columns == ex_base._summary_columns
+      assert set(ex._hypotheses.values()) == set(ex_base._hypotheses.values())
+
+      # rows should be sorted according to the new multiindex
+      assert ex._df.index.get_level_values('env_id').tolist() == [
+          'halfcheetah', 'halfcheetah', \
+          'hopper', 'hopper', \
+          'humanoid', 'humanoid',
+      ]
+      assert ex._df.index.get_level_values('common_hparam').tolist() == [1] * 6
+      assert ex._df.index.get_level_values('algo').tolist() == [
+          'ppo', 'sac', 'ppo', 'sac', 'ppo', 'sac'
+      ]
+
+    # (1) full reordering
+    ex1 = ex_base.with_config_keys(['env_id', 'common_hparam', 'algo'])
+    assert ex1._config_keys == ['env_id', 'common_hparam', 'algo']
+    validate_env_id_algo(ex1)
+
+    # (2) partial with ellipsis
+    ex2 = ex_base.with_config_keys(['env_id', ...])
+    assert ex2._config_keys == ['env_id', 'algo', 'common_hparam']
+    validate_env_id_algo(ex2)
+
+    # (3) partial subset. TODO: Things to decide:
+    # - To reduce or not to reduce?
+    # - Hypothesis objects should remain the same or changes in
+    #   name, config, etc.?
+
+    # (4) not existing keys: error
+    with pytest.raises(ValueError, \
+                       match="'foo' not found in the config of") as e:
+      ex_base.with_config_keys(['env_id', 'foo', 'algo'])
+
   def test_select_top(self):
     # yapf: disable
     hypos = [
@@ -716,11 +850,25 @@ class TestExperiment(_TestBase):
     with pytest.raises(ValueError, match='k must be smaller than the number of hypotheses'):  # yapf: disable
       ex.select_top("score", k=6)
 
+  def test_resample(self):
+    h: Hypothesis = TestHypothesis._fixture()
+    h.config = {"kind": "subsample"}
+
+    ex = Experiment(
+        name="interp_test", hypotheses=[h], summary_columns=('x', 'y'))
+    ex2 = ex.resample(n_samples=91)
+    assert ex2.hypotheses[0]._dataframes[0].__len__() == 91
+    assert ex2.hypotheses[0]._dataframes[1].__len__() == 91
+
+    assert ex2._config_keys == ex._config_keys
+    assert ex2._summary_columns == ex._summary_columns
+
   def test_interpolate(self):
     h: Hypothesis = TestHypothesis._fixture()
     h.config = {"kind": "interpolate"}
 
-    ex = Experiment(name="interp_test", hypotheses=[h])
+    ex = Experiment(
+        name="interp_test", hypotheses=[h], summary_columns=('x', 'y'))
     ex_interpolated = ex.interpolate("x", n_samples=91)
     assert ex_interpolated.hypotheses[0]._dataframes[0].index.name == 'x'
     assert ex_interpolated.hypotheses[0]._dataframes[1].index.name == 'x'
@@ -728,7 +876,63 @@ class TestExperiment(_TestBase):
     assert ex_interpolated.hypotheses[0]._dataframes[1].__len__() == 91
 
     assert ex_interpolated._config_keys == ex._config_keys
-    assert ex_interpolated._summary_columns == ex._summary_columns
+    assert ex_interpolated._summary_columns == ex._summary_columns == ('x', 'y')
+
+  def test_select_query(self, runs_gridsearch: RunList):
+    """Tests Experiment.select()"""
+
+    df = runs_gridsearch.to_dataframe(
+        as_hypothesis=True,
+        config_fn=_runs_gridsearch_config_fn,
+        include_config=True,
+    )
+    base_ex = Experiment.from_dataframe(df)
+    assert len(base_ex.hypotheses) == 6  # [ppo, sac] * (3 envs)
+
+    # Create a sub-view of Experiment by applying the query.
+    ex = base_ex.select('env_id == "halfcheetah"')
+    assert len(ex.hypotheses) == 2
+    assert ex.hypotheses[0].config['env_id'] == "halfcheetah"  # type: ignore
+    assert ex.hypotheses[1].config['env_id'] == "halfcheetah"  # type: ignore
+
+    assert ex._df.index.names == base_ex._df.index.names
+    assert list(ex._df.index.get_level_values('name')) == [
+        'algo=ppo; env_id=halfcheetah',
+        'algo=sac; env_id=halfcheetah',
+    ]
+    # the underlying hypothesis objects must be the same.
+    assert set(ex.hypotheses) == set(h for h in base_ex.hypotheses if \
+                                     'halfcheetah' in h.name)
+
+  def test_select_fn(self, runs_gridsearch: RunList):
+    """Tests Experiments.select()"""
+
+    df = runs_gridsearch.to_dataframe(
+        as_hypothesis=True,
+        config_fn=_runs_gridsearch_config_fn,
+        include_config=True,
+    )
+    base_ex = Experiment.from_dataframe(df)
+    assert len(base_ex.hypotheses) == 6  # [ppo, sac] * (3 envs)
+
+    ex = base_ex.select(lambda h: 'humanoid' in h.name)
+    assert len(ex.hypotheses) == 2
+    assert ex.hypotheses[0].config['env_id'] == "humanoid"  # type: ignore
+    assert ex.hypotheses[1].config['env_id'] == "humanoid"  # type: ignore
+
+    ex = base_ex.select(lambda h: True)
+    assert len(ex.hypotheses) == len(base_ex.hypotheses)
+
+    ex = base_ex.select(lambda h: h.name == 'algo=sac; env_id=halfcheetah')
+    assert len(ex.hypotheses) == 1
+
+    # error case
+    with pytest.raises(
+        TypeError,
+        match=('The filter function must return bool, '
+               'but unexpected data type found: float64')):
+      ex = base_ex.select(
+          lambda h: np.asarray(1.0, dtype=np.float64))  # type: ignore
 
   def test_plot_method(self):
     import expt.plot

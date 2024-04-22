@@ -1,5 +1,7 @@
 """Data Loader for expt."""
 
+from __future__ import annotations
+
 import abc
 import asyncio
 import atexit
@@ -14,9 +16,11 @@ import pathlib
 from pathlib import Path
 import sys
 import tempfile
-from typing import (Any, Callable, Dict, Generic, Iterator, List, NamedTuple,
-                    Optional, Sequence, Tuple, Type, TYPE_CHECKING, TypeVar,
-                    Union)
+from typing import (Any, Callable, Dict, Generic, Iterator, List, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple, Type, TYPE_CHECKING,
+                    TypeVar, Union)
+from typing_extensions import get_args  # python 3.7 support
+from typing_extensions import Protocol
 
 import multiprocess.pool
 import numpy as np
@@ -34,9 +38,9 @@ except ImportError:
 
 if TYPE_CHECKING:
   from tqdm import tqdm as tqdm_std
-  ProgressBar = Union[tqdm, tqdm_std]
+  ProgressBar = tqdm_std
 else:
-  ProgressBar = Any
+  ProgressBar = Any  # type: ignore
 
 try:
   import tensorboard
@@ -46,6 +50,8 @@ except ImportError:
 #########################################################################
 # Individual Run Reader
 #########################################################################
+
+LogDir = path_util.PathType
 
 LogReaderContext = TypeVar('LogReaderContext')
 
@@ -65,18 +71,18 @@ class LogReader(abc.ABC, Generic[LogReaderContext]):
   eventfile for a TensorboardLogReader.
   """
 
-  def __init__(self, log_dir):
-    if not isinstance(log_dir, (pathlib.Path, str)):
+  def __init__(self, log_dir: LogDir):
+    if not isinstance(log_dir, get_args(LogDir)):
       raise TypeError(f"`log_dir` must be a `str` or `Path`,"
                       f" but given {type(log_dir)}")
-    self._log_dir = str(log_dir)
+    self._log_dir = log_dir
 
     if not path_util.isdir(log_dir):
       raise FileNotFoundError(log_dir)
 
   @property
   def log_dir(self) -> str:
-    return self._log_dir
+    return str(self._log_dir)
 
   @abc.abstractmethod
   def new_context(self) -> LogReaderContext:
@@ -114,7 +120,7 @@ class CannotHandleException(RuntimeError):
   """Raised when LogReader cannot handle a given directory."""
 
   def __init__(self,
-               log_dir,
+               log_dir: LogDir,
                reader: Optional[LogReader] = None,
                reason: str = ""):
     msg = f"log_dir `{log_dir}` cannot be handled"
@@ -129,7 +135,7 @@ class CannotHandleException(RuntimeError):
 class CSVLogReader(LogReader[pd.DataFrame]):
   """Parse log data from progress.csv per convention."""
 
-  def __init__(self, log_dir):
+  def __init__(self, log_dir: LogDir):
     super().__init__(log_dir=log_dir)
 
     # Find the target CSV file.
@@ -225,7 +231,7 @@ class TensorboardLogReader(  # ...
   RustTensorboardLogReader is recommended.
   """
 
-  def __init__(self, log_dir):
+  def __init__(self, log_dir: LogDir):
     super().__init__(log_dir=log_dir)
 
     # Initialize the resources.
@@ -275,7 +281,7 @@ class TensorboardLogReader(  # ...
                                 skip=0, limit=None,  # per event_file
                                 rows_callback):  # yapf: disable
     if not TYPE_CHECKING:
-      from tensorboard.compat.proto.event_pb2 import Event
+      from tensorboard.compat.proto.event_pb2 import Event  # type: ignore
     else:
 
       class Event(NamedTuple):  # a type checking stub, see event_pb2.Event
@@ -359,7 +365,7 @@ class RustTensorboardLogReader(LogReader[Dict]):
   TensorboardLogReader written in Python.
   """
 
-  def __init__(self, log_dir):
+  def __init__(self, log_dir: LogDir):
     super().__init__(log_dir=log_dir)
 
     # Import early, so that multiprocess workers do not need to import again
@@ -427,6 +433,10 @@ class RustTensorboardLogReader(LogReader[Dict]):
     df.index.name = 'global_step'
     df['global_step'] = df.index.astype(int)
     df = df.reindex(sorted(df.columns), axis=1)
+
+    # Ensure index (timestep) is sorted because the chunk read by
+    # rustboard is not necessarily sorted.
+    df = df.sort_index()
     return df
 
 
@@ -437,7 +447,7 @@ DEFAULT_READER_CANDIDATES = (
 )
 
 
-def _get_reader_for(log_dir,
+def _get_reader_for(log_dir: LogDir,
                     *,
                     candidates: Optional[Sequence[Type[LogReader]]] = None,
                     verbose=False) -> LogReader:
@@ -469,7 +479,7 @@ def _get_reader_for(log_dir,
 
 
 def parse_run(
-    log_dir: Union[str, Path],
+    log_dir: LogDir,
     *,
     reader_cls: Optional[Type[LogReader]] = None,
     verbose=False,
@@ -499,12 +509,12 @@ def parse_run(
   return df
 
 
-def parse_run_progresscsv(log_dir, verbose=False) -> pd.DataFrame:
+def parse_run_progresscsv(log_dir: LogDir, verbose=False) -> pd.DataFrame:
   return parse_run(log_dir, reader_cls=CSVLogReader,
                    verbose=verbose)  # yapf: disable
 
 
-def parse_run_tensorboard(log_dir, verbose=False) -> pd.DataFrame:
+def parse_run_tensorboard(log_dir: LogDir, verbose=False) -> pd.DataFrame:
   return parse_run(log_dir, reader_cls=RustTensorboardLogReader,
                    verbose=verbose)  # yapf: disable
 
@@ -514,7 +524,7 @@ def parse_run_tensorboard(log_dir, verbose=False) -> pd.DataFrame:
 #########################################################################
 
 
-def _validate_run_postprocess(run):
+def _validate_run_postprocess(run: Run):
   if not isinstance(run, Run):
     raise TypeError("run_postprocess_fn did not return a "
                     "Run object; given {}".format(type(run)))
@@ -616,6 +626,59 @@ async def get_runs_async(
 
 
 #########################################################################
+# Config Reader
+#########################################################################
+
+RunConfig = Mapping[str, Any]
+
+
+class ConfigReader(Protocol):
+
+  def __call__(self, log_dir: LogDir) -> Optional[RunConfig]:
+    ...  # may raise FileNotFoundError
+
+
+class YamlConfigReader(ConfigReader):
+  """Reads config.yaml from the log directory.
+
+  Raises FileNotFoundError if config can't be found."""
+
+  def __init__(
+      self,
+      config_filename: str = "config.yaml",
+  ):
+    self._config_filename = config_filename
+    try:
+      import yaml
+    except ImportError as ex:
+      raise ImportError("module `yaml` not found. "
+                        "Please install pyyaml>=6.0") from ex
+
+  def __call__(self, log_dir: LogDir) -> Optional[RunConfig]:
+    import yaml
+    p = os.path.join(log_dir, self._config_filename)
+    with path_util.open(p) as fp:
+      d = yaml.load(fp, yaml.SafeLoader)
+    return d
+
+
+class ConfigReaderComposite(ConfigReader):
+
+  def __init__(self, config_readers: Sequence[ConfigReader]):
+    self._config_readers = config_readers
+
+  def __call__(self, log_dir: LogDir) -> Optional[RunConfig]:
+    for reader in self._config_readers:
+      try:
+        return reader(log_dir)
+      except FileNotFoundError:
+        pass
+
+    # No config is available
+    return None
+
+
+#########################################################################
 # Run Loader Objects
 #########################################################################
 
@@ -631,8 +694,8 @@ class RunLoader:
       run_postprocess_fn: Optional[Callable[[Run], Run]] = None,
       n_jobs: int = 8,
       pool_class=multiprocess.pool.Pool,
-      reader_cls: Union[None, Type[LogReader],  # ...
-                        Sequence[Type[LogReader]]] = None,
+      reader_cls: Type[LogReader] | Sequence[Type[LogReader]] | None = None,
+      config_reader: ConfigReader | Sequence[ConfigReader] | None = None,
   ):
     self._readers: List[LogReader] = []
     self._reader_contexts = []
@@ -644,6 +707,12 @@ class RunLoader:
     if isinstance(reader_cls, Type):
       reader_cls = [reader_cls]
     self._reader_cls: Optional[Sequence[Type[LogReader]]] = reader_cls
+
+    if config_reader is None:
+      config_reader = [YamlConfigReader()]
+    elif not isinstance(config_reader, Sequence):
+      config_reader = [config_reader]
+    self._config_reader: ConfigReader = ConfigReaderComposite(config_reader)
 
     self.add_paths(*path_globs)
 
@@ -693,7 +762,7 @@ class RunLoader:
         # TODO: When any one of them fails or not ready? ignore, or raise?
         self.add_log_dir(log_dir)
 
-  def add_log_dir(self, log_dir: Union[Path, str]) -> LogReader:
+  def add_log_dir(self, log_dir: LogDir) -> LogReader:
     reader = _get_reader_for(log_dir, candidates=self._reader_cls)
     self.add_reader(reader)
     return reader
@@ -705,15 +774,24 @@ class RunLoader:
   @staticmethod
   def _worker_handler(
       reader: LogReader,  # pickled and passed into a worker
+      config_reader: ConfigReader,  # pickled as well..
       context: LogReaderContext,
       run_postprocess_fn: Optional[Callable[[Run], Run]] = None,
   ) -> Tuple[Optional[Run], LogReaderContext]:
     """The job function to be executed in a "forked" worker process."""
     try:
       with path_util.session():
+        # read run data
         context = reader.read(context)
         df = reader.result(context)
         run = Run(path=reader.log_dir, df=df)
+
+        # read config
+        config: Optional[RunConfig] = config_reader(reader.log_dir)
+        if config is not None:
+          run.config = config
+
+        # postprocess if specified
         if run_postprocess_fn:
           run = run_postprocess_fn(run)
           _validate_run_postprocess(run)
@@ -764,7 +842,7 @@ class RunLoader:
             self._worker_handler,
             # Note: Serialization of context can be EXTREMELY slow
             # depending on the data type of context objects.
-            args=[reader, context],
+            args=[reader, self._config_reader, context],
             kwds=dict(run_postprocess_fn=self._run_postprocess_fn),
             callback=_pbar_callback_done,
             error_callback=_pbar_callback_error,
@@ -814,6 +892,7 @@ class RunLoader:
       run, new_context = self._worker_handler(
           reader=reader,
           context=self._reader_contexts[j],
+          config_reader=self._config_reader,
           run_postprocess_fn=self._run_postprocess_fn)
       self._reader_contexts[j] = new_context
 
@@ -861,5 +940,7 @@ __all__ = (
     'CSVLogReader',
     'TensorboardLogReader',
     'RustTensorboardLogReader',
+    'ConfigReader',
+    'YamlConfigReader',
     'RunLoader',
 )

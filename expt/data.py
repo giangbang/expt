@@ -23,10 +23,11 @@ Note that one can also manage a collection of Experiments (e.g. the same set
 of hypotheses or algorithms applied over different environments or dataset).
 """
 
+from __future__ import annotations
+
 import collections
 import copy
 import dataclasses
-from dataclasses import dataclass
 import difflib
 import fnmatch
 from importlib import import_module as _import
@@ -42,12 +43,17 @@ from typing_extensions import Literal
 import numpy as np
 import pandas as pd
 from pandas.core.groupby.generic import DataFrameGroupBy
-from scipy import interpolate
+import scipy.interpolate
 from typeguard import typechecked
 
 from expt import util
 
 T = TypeVar('T')
+
+if hasattr(types, 'EllipsisType'):
+  EllipsisType = types.EllipsisType
+else:
+  EllipsisType = type(...)
 
 #########################################################################
 # Data Classes
@@ -56,7 +62,7 @@ T = TypeVar('T')
 RunConfig = Mapping[str, Any]
 
 
-@dataclass
+@dataclasses.dataclass
 class Run:
   """Represents a single run, containing one pd.DataFrame object
   as well as other metadata (path, config, etc.)
@@ -97,7 +103,7 @@ class Run:
     path = self.path.rstrip('/')
     return os.path.basename(path)
 
-  def with_config(self, config: RunConfig) -> 'Run':
+  def with_config(self, config: RunConfig) -> Run:
     """Create a new Run instance with the given `config`."""
     if not isinstance(config, Mapping) and callable(config):
       config = config(self)
@@ -105,9 +111,13 @@ class Run:
       raise TypeError(f"`config` must be a Mapping, but given {type(config)}")
     return dataclasses.replace(self, config=config)
 
-  def to_hypothesis(self) -> 'Hypothesis':
+  def to_hypothesis(self) -> Hypothesis:
     """Create a new `Hypothesis` consisting of only this run."""
     return Hypothesis.of(self)
+
+  @property
+  def _dataframes(self) -> List[pd.DataFrame]:
+    return [self.df]
 
   def summary(self, **kwargs) -> pd.DataFrame:
     """Return a DataFrame that summarizes the current run."""
@@ -128,14 +138,17 @@ class Run:
 def _default_config_fn(run: Run) -> RunConfig:
   if run.config is not None:
     return run.config
-  raise ValueError(f"A Run with name `{run.name}` does not have config.")
+  raise ValueError(
+      f"A Run with name `{run.name}` does not have config. "
+      "For those runs that do not have any config data available "
+      "(see config_reader), consider using the config_fn=... parameter.")
 
 
 class RunList(Sequence[Run]):
   """A (immutable) list of Run objects, but with some useful utility
   methods such as filtering, searching, and handy format conversion."""
 
-  def __init__(self, runs: Union[Run, Iterable[Run]]):
+  def __init__(self, runs: Run | Iterable[Run]):
     runs = self._validate_type(runs)
     self._runs: List[Run] = list(runs)
 
@@ -163,10 +176,10 @@ class RunList(Sequence[Run]):
   @overload
   def __getitem__(self, index_or_slice: int) -> Run: ...
   @overload
-  def __getitem__(self, index_or_slice: slice) -> 'RunList': ...
+  def __getitem__(self, index_or_slice: slice) -> RunList: ...
   # yapf: enable
 
-  def __getitem__(self, index_or_slice) -> Union[Run, 'RunList']:
+  def __getitem__(self, index_or_slice) -> Run | RunList:
     o = self._runs[index_or_slice]
     if isinstance(index_or_slice, slice):
       o = RunList(o)
@@ -190,7 +203,15 @@ class RunList(Sequence[Run]):
     """Create a new copy of list containing all the runs."""
     return list(self._runs)
 
-  INDEX_EXCLUDE_DEFAULT = ('seed', 'random_seed', 'log_dir', 'train_dir')
+  # TODO: Make this more configurable.
+  INDEX_EXCLUDE_DEFAULT = (
+      'seed',
+      'random_seed',
+      'log_dir',
+      'train_dir',
+      'ckpt_dir',
+      'checkpoint_dir',
+  )
 
   def varied_config_keys(
       self,
@@ -358,8 +379,10 @@ class RunList(Sequence[Run]):
 
     return df  # type: ignore
 
-  def filter(self, fn: Union[Callable[[Run], bool], str,
-                             re.Pattern]) -> 'RunList':
+  def to_experiment(self, **kwargs) -> Experiment:
+    return Experiment.from_runs(self, **kwargs)
+
+  def filter(self, fn: Callable[[Run], bool] | str | re.Pattern) -> RunList:
     """Apply a filter and return the filtered runs as another RunList.
 
     The filter is a function (Run -> bool). Only runs that evaluates this
@@ -378,7 +401,7 @@ class RunList(Sequence[Run]):
       fn = lambda run: bool(pat.search(run.name))
     return RunList(filter(fn, self._runs))
 
-  def grep(self, regex: Union[str, re.Pattern], flags=0):
+  def grep(self, regex: str | re.Pattern, flags=0):
     """Apply a regex-based filter on the path of `Run`, and return the
     matched `Run`s as a RunList."""
     if isinstance(regex, str):
@@ -390,7 +413,7 @@ class RunList(Sequence[Run]):
     as a plain list."""
     return list(map(func, self._runs))
 
-  def to_hypothesis(self, name: str) -> 'Hypothesis':
+  def to_hypothesis(self, name: str) -> Hypothesis:
     """Create a new Hypothesis instance containing all the runs
     as the current RunList instance."""
     return Hypothesis.of(self, name=name)
@@ -413,9 +436,11 @@ class RunList(Sequence[Run]):
       name: a function that maps the group (Key) into Hypothesis name (str).
 
     Example:
+      >>> key_func: Callable[[Run], Tuple[str, str]]
       >>> key_func = lambda run: re.search(
       >>>     "algo=(\w+),lr=([.0-9]+)", run.name).group(1, 2)
       >>> for group_name, hypothesis in runs.groupby(key_func):
+      >>>   # group_name: Tuple[str, str]
       >>>   ...
 
     """
@@ -467,10 +492,16 @@ def varied_config_keys(
   return keys
 
 
-@dataclass
+@dataclasses.dataclass
 class Hypothesis(Iterable[Run]):
+  """Represents a single Hypothesis.
+
+  A Hypothesis a group of runs with the same configuration; can represent a
+  variant, algorithm, or such an instance with a specific set of hyperparamters.
+  """
   name: str
   runs: RunList
+  style: Dict[str, Any]  # TODO: Use some typing. TODO: Add tests.
   config: Optional[RunConfig] = None
 
   @typechecked
@@ -479,6 +510,7 @@ class Hypothesis(Iterable[Run]):
       name: str,
       runs: Union[Run, Iterable[Run]],
       *,
+      style: Optional[Dict[str, Any]] = None,
       config: Union[RunConfig, Literal['auto'], None] = 'auto',
   ):
     """Create a new Hypothesis object.
@@ -486,6 +518,8 @@ class Hypothesis(Iterable[Run]):
     Args:
       name: The name of the hypothesis. Should be unique within an Experiment.
       runs: The underlying runs that this hypothesis consists of.
+      style: (optional) A dict that represents preferred style for plotting.
+        These will be passed as kwargs to plot().
       config: A config dict that describes the configuration of the hypothesis.
         A config is optional, where `config` is explicitly set to be `None`.
         If config exists (not None), it should represent the config this
@@ -519,6 +553,7 @@ class Hypothesis(Iterable[Run]):
                              r.name for r in self.runs if r.config is None))
 
     self.config = config
+    self.style = {**style} if style is not None else {}
 
   def __iter__(self) -> Iterator[Run]:
     return iter(self.runs)
@@ -526,16 +561,19 @@ class Hypothesis(Iterable[Run]):
   @classmethod
   def of(
       cls,
-      runs: Union[Run, Iterable[Run]],
+      runs: Run | Sequence[Run],
       *,
       name: Optional[str] = None,
       config: Union[RunConfig, Literal['auto'], None] = 'auto',
-  ) -> 'Hypothesis':
+  ) -> Hypothesis:
     """A static factory method."""
     if isinstance(runs, Run):
       name = name or runs.path
 
     return cls(name=name or '', runs=runs, config=config)
+
+  def rename(self, name: str) -> Hypothesis:
+    return dataclasses.replace(self, name=name)
 
   # yapf: disable
   @overload
@@ -597,7 +635,7 @@ class Hypothesis(Iterable[Run]):
       raise RuntimeError("This hypothesis contains no runs.")
     return config
 
-  def _is_compatible(self, other: Union['Hypothesis', Run]):
+  def _is_compatible(self, other: Hypothesis | Run):
     if self.config and other.config:
       config: RunConfig = self.config
       rhs: RunConfig = other.config
@@ -614,8 +652,8 @@ class Hypothesis(Iterable[Run]):
 
   if TYPE_CHECKING:  # Provide type hint and documentation for static checker.
     import expt.plot
-    plot: expt.plot.HypothesisPlotter
-    hvplot: expt.plot.HypothesisHvPlotter
+    plot: expt.plot.HypothesisPlotter  # type: ignore
+    hvplot: expt.plot.HypothesisHvPlotter  # type: ignore
 
   plot = util.PropertyAccessor(  # type: ignore
       "plot", lambda self: _import("expt.plot").HypothesisPlotter(self))
@@ -649,36 +687,40 @@ class Hypothesis(Iterable[Run]):
   def rolling(self, *args, **kwargs):
     return self.grouped.rolling(*args, **kwargs)
 
-  def mean(self, *args, **kwargs) -> pd.DataFrame:
+  def mean(self, *args, numeric_only=True, **kwargs) -> pd.DataFrame:
     g = self.grouped
-    return g.mean(*args, **kwargs)  # type: ignore
+    return g.mean(*args, numeric_only=numeric_only, **kwargs)
 
-  def std(self, *args, **kwargs) -> pd.DataFrame:
+  def std(self, *args, numeric_only=True, **kwargs) -> pd.DataFrame:
     g = self.grouped
-    return g.std(*args, **kwargs)  # type: ignore
+    return g.std(*args, numeric_only=numeric_only, **kwargs)
 
-  def min(self, *args, **kwargs) -> pd.DataFrame:
+  def min(self, *args, numeric_only=True, **kwargs) -> pd.DataFrame:
     g = self.grouped
-    return g.min(*args, **kwargs)  # type: ignore
+    return g.min(*args, numeric_only=numeric_only, **kwargs)
 
-  def max(self, *args, **kwargs) -> pd.DataFrame:
+  def max(self, *args, numeric_only=True, **kwargs) -> pd.DataFrame:
     g = self.grouped
-    return g.max(*args, **kwargs)  # type: ignore
+    return g.max(*args, numeric_only=numeric_only, **kwargs)
 
-  def interpolate(self,
-                  x_column: Optional[str] = None,
-                  *,
-                  n_samples: int) -> 'Hypothesis':
-    """Interpolate by uniform subsampling, and return a processed hypothesis.
+  def resample(self,
+               x_column: Optional[str] = None,
+               *,
+               n_samples: int) -> Hypothesis:
+    """Resample (usually downsample) the data by uniform subsampling.
 
-    This is useful when the hypothesis' individual runs may have heterogeneous
-    index (or the x-axis column).
+    This is also useful when the hypothesis' individual runs may have
+    heterogeneous index or the x-axis (i.e., differnet supports): when
+    (linear) interpolation is applied, the resulting Hypothesis will consist of
+    runs with dataframes sharing the same x axis values.
 
     Args:
-      x_column (Optional): the name of column to interpolate on. If None,
-        we interpolate and subsample based on the index of dataframe.
-      n_samples (int): The number of points to use when subsampling and
-        interpolation. Should be greater than 2.
+      x_column (Optional): the name of column to sample over. If `None`,
+        sampling and interpolation will be done over the index of the dataframe.
+      n_samples (int): The number of points to use when subsampling.
+        Should be greater than 2.
+      interpolate (bool): Defaults False. If True, linear interpolation will
+        be applied
 
     Returns:
       A copy of Hypothesis with the same name, whose runs (DataFrames) consists
@@ -686,6 +728,20 @@ class Hypothesis(Iterable[Run]):
       other non-numeric columns will be dropped. Each DataFramew will have
       the specified x_column as its Index.
     """
+    return self._resample(x_column, n_samples, interpolate=False)
+
+  def interpolate(self,
+                  x_column: Optional[str] = None,
+                  *,
+                  n_samples: int) -> Hypothesis:
+    """DEPRECATED: Use resample(..., interpolate=True) instead."""
+    return self._resample(x_column, n_samples=n_samples, interpolate=True)
+
+  def _resample(self,
+                x_column: Optional[str],
+                n_samples: int,
+                *,
+                interpolate=False) -> Hypothesis:
     # For each dataframe (run), interpolate on the `x_column` or index
     if x_column is None:
       x_series = pd.concat([pd.Series(df.index) for df in self._dataframes])
@@ -701,15 +757,10 @@ class Hypothesis(Iterable[Run]):
     x_max = x_series.max()
     x_samples = np.linspace(x_min, x_max, num=n_samples)  # type: ignore
 
-    # Get interpolated dataframes.
-    dfs_interp = []
-    for df in self._dataframes:
-      df: pd.DataFrame
+    # Get interpolated dataframes for numerical columns.
+    def _process_df_interpolate(df: pd.DataFrame) -> pd.DataFrame:
       if x_column is not None:
         df = df.set_index(x_column)  # type: ignore
-
-      # filter out non-numeric columns.
-      df = df.select_dtypes(['number'])
 
       # yapf: disable
       def _interpolate_if_numeric(y_series: pd.Series):
@@ -718,9 +769,9 @@ class Hypothesis(Iterable[Run]):
           # properly deal with nan. So we filter both of x and y series.
           idx_valid = ~np.isnan(y_series)
           if idx_valid.sum() >= 2:
-            return interpolate.interp1d(df.index[idx_valid],
-                                        y_series[idx_valid],
-                                        bounds_error=False)(x_samples)
+            return scipy.interpolate.interp1d(df.index[idx_valid],
+                                              y_series[idx_valid],
+                                              bounds_error=False)(x_samples)
           else:
             # Insufficient data due to a empty/crashed run.
             # Ignore the corner case! TODO: Add warning message.
@@ -731,21 +782,35 @@ class Hypothesis(Iterable[Run]):
           assert False, "should have been dropped earlier"
       # yapf: enable
 
-      df_interp = df.apply(_interpolate_if_numeric)
+      # filter out non-numeric columns.
+      df_interp = df.select_dtypes(['number'])
+      df_interp = cast(pd.DataFrame, df_interp.apply(_interpolate_if_numeric))
+
       df_interp[index_name] = x_samples
       df_interp.set_index(index_name, inplace=True)
-      dfs_interp.append(df_interp)
+      return df_interp
 
-    assert len(dfs_interp) == len(self.runs)
+    def _process_df_subsample(df: pd.DataFrame) -> pd.DataFrame:
+      if n_samples <= df.shape[0]:
+        return df
+      idx = np.linspace(0, df.shape[0] - 1, n_samples, dtype=np.int32)
+      return df.loc[idx]
+
+    if interpolate:
+      processed_dfs = [_process_df_interpolate(df) for df in self._dataframes]
+    else:
+      processed_dfs = [_process_df_subsample(df) for df in self._dataframes]
+
+    assert len(processed_dfs) == len(self.runs)
     return Hypothesis(
         name=self.name,
         runs=[
-            Run(r.path, df_new) for (r, df_new) in zip(self.runs, dfs_interp)
+            Run(r.path, df_new) for (r, df_new) in zip(self.runs, processed_dfs)
         ],
         config=copy.copy(self.config),
     )
 
-  def apply(self, fn: Callable[[pd.DataFrame], pd.DataFrame]) -> 'Hypothesis':
+  def apply(self, fn: Callable[[pd.DataFrame], pd.DataFrame]) -> Hypothesis:
     """Apply a transformation on all underlying DataFrames.
 
     This returns a copy of Hypothesis and children Run objects.
@@ -784,7 +849,8 @@ class Experiment(Iterable[Hypothesis]):
 
     if isinstance(summary_columns, str):
       summary_columns = [summary_columns]
-    self._summary_columns = summary_columns if summary_columns is not None else None
+    self._summary_columns = tuple(summary_columns) \
+      if summary_columns is not None else None
 
     # The internal pd.DataFrame representation that backs Experiment.
     # index   = [*config_keys, name: str]  (a MultiIndex)
@@ -796,43 +862,103 @@ class Experiment(Iterable[Hypothesis]):
     for h in hypotheses:
       self.add_hypothesis(h, extend_if_conflict=False)
 
+  def _replace(self, **kwargs) -> Experiment:
+    ex = Experiment(
+        name=kwargs.pop('name', self._name),
+        hypotheses=list(self._hypotheses.values()),
+        config_keys=kwargs.pop('config_keys', self._config_keys),
+        summary_columns=kwargs.pop('summary_columns', self._summary_columns),
+    )
+    if kwargs:
+      raise ValueError("Unknown fields: {}".format(list(kwargs.keys())))
+    return ex
+
   @property
   def _df(self) -> pd.DataFrame:
+    hypotheses: List[Hypothesis] = list(self._hypotheses.values())
+
     df = pd.DataFrame({
-        'name': list(self._hypotheses.keys()),
-        'hypothesis': list(self._hypotheses.values()),
+        'name': [h.name for h in hypotheses],
+        'hypothesis': hypotheses,
         **{  # config keys (will be index)
-            k: [(h.config or {}).get(k) for h in self._hypotheses.values()] \
+            k: [(h.config or {}).get(k) for h in hypotheses]
             for k in self._config_keys
         },
     })
 
-    if self._summary_columns:
-      # TODO: h.summary is expensive and slow, cache it
+    def _append_summary(summary_columns):
+      nonlocal df
       df = pd.concat([
           df,
           pd.DataFrame({
               k: [
-                  h.summary(columns=self._summary_columns).loc[0, k]
+                  # TODO: h.summary is expensive and slow, cache it
+                  h.summary(columns=summary_columns).loc[0, k]
                   for h in self._hypotheses.values()
-              ] for k in self._summary_columns
+              ] for k in summary_columns
           }),
       ], axis=1)  # yapf: disable
 
-    df = df.set_index([*self._config_keys, 'name'])
+    if self._summary_columns is not None:
+      _append_summary(summary_columns=self._summary_columns)
+    else:
+      _append_summary(summary_columns=self.columns)
+
+    # Need to sort index w.r.t the multi-index level hierarchy, because
+    # the order of hypotheses being added is not guaranteed
+    df = df.set_index([*self._config_keys, 'name']).sort_index()
     return df
+
+  @classmethod
+  def from_runs(
+      cls,
+      runs: RunList,
+      *,
+      config_fn: Callable[[Run], RunConfig] = _default_config_fn,
+      config_keys: Optional[Sequence[str]] = None,
+      summary_columns: Optional[Sequence[str]] = None,
+      name: Optional[str] = None,
+  ) -> Experiment:
+    """Construct a new Experiment object directly from a RunList."""
+
+    df = runs.to_dataframe(
+        include_config=True,
+        config_fn=config_fn,
+        index_keys=config_keys,
+        as_hypothesis=True,
+        include_summary=True,
+        hypothesis_namer=None,  # TODO use more general hypothesis_factory.
+    )
+
+    if summary_columns:
+      try:
+        df = df[['hypothesis', *summary_columns]]
+      except KeyError:
+        # summary_columns often have many mistakes or missing keys,
+        # so let the error message more informative.
+        missing_cols = [col for col in summary_columns if col not in df.keys()]
+        suggestions = [
+            difflib.get_close_matches(col, df.keys()) for col in missing_cols
+        ]
+        linesep = '\n'
+        raise KeyError(
+            f"Some columns do not exist in the dataframe: {missing_cols}. "
+            f"Close matches = {linesep.join(str(s) for s in suggestions)}"
+        ) from None
+
+    return cls.from_dataframe(cast(pd.DataFrame, df), name=name)
 
   @classmethod
   def from_dataframe(
       cls,
       df: pd.DataFrame,
-      by: Optional[Union[str, Sequence[str]]] = None,
+      by: None | str | Sequence[str] = None,
       *,
       run_column: str = 'run',
       hypothesis_namer: Optional[  # (run_config, runs) -> str
           Callable[[RunConfig, Sequence[Run]], str]] = None,
       name: Optional[str] = None,
-  ) -> 'Experiment':
+  ) -> Experiment:
     """Constructs a new Experiment object from a DataFrame instance,
     that is structured as per the convention. The DataFrame objects are
     usually constructed from `RunList.to_dataframe()`.
@@ -871,7 +997,7 @@ class Experiment(Iterable[Hypothesis]):
     else:
       config_keys = None
 
-    def _aslist(x: Union[None, str, Sequence[str]]) -> List[str]:
+    def _aslist(x: None | str | Sequence[str]) -> List[str]:
       if x is None:
         return []
       if isinstance(x, str):
@@ -921,8 +1047,7 @@ class Experiment(Iterable[Hypothesis]):
   def add_runs(
       self,
       hypothesis_name: str,
-      runs: Union[List[Union[Run, Tuple[str, pd.DataFrame], pd.DataFrame]],
-                  RunList],
+      runs: RunList | List[Run | Tuple[str, pd.DataFrame] | pd.DataFrame],
   ) -> Hypothesis:
     util.warn_deprecated(
         "add_runs() is deprecated. Use add_hypothesis() instead.")
@@ -994,7 +1119,7 @@ class Experiment(Iterable[Hypothesis]):
       key,
       k=None,
       descending=True,
-  ) -> Union[Hypothesis, Sequence[Hypothesis]]:
+  ) -> Hypothesis | Sequence[Hypothesis]:
     """Choose a hypothesis that has the largest value on the specified column.
 
     Args:
@@ -1032,6 +1157,28 @@ class Experiment(Iterable[Hypothesis]):
     else:
       return candidates[:k]
 
+  def select(self, expr: str | Callable[[Hypothesis], bool]) -> Experiment:
+    """Select a subset of Hypothesis matching the given criteria."""
+
+    if isinstance(expr, str):
+      df = self._df.query(expr)
+      name = self.name + "[" + expr + "]"
+
+    elif callable(expr):  # Hypothesis -> bool
+      df = self._df
+      mask = df['hypothesis'].apply(expr)
+      if mask.dtype != bool:
+        raise TypeError("The filter function must return bool, but unexpected "
+                        "data type found: {}".format(mask.dtype))
+      df = df[mask]
+      name = self.name  # TODO: Customize? repr(fn)?
+
+    else:
+      raise TypeError(  # ...
+          "`expr` must be a str or Callable, but given {}".format(type(expr)))
+
+    return Experiment.from_dataframe(df, name=name)
+
   def __iter__(self) -> Iterator[Hypothesis]:
     return iter(self._hypotheses.values())
 
@@ -1042,20 +1189,18 @@ class Experiment(Iterable[Hypothesis]):
         ",\n])")
 
   def _repr_html_(self, include_hypothesis=False, include_name=True):
-    try:
-      from pandas._config import get_option
-    except ImportError:
-      get_option = lambda _: None
 
     # TODO: more fine-grained control of style.
     df = self._df
+    hypotheses = df['hypothesis']
+
     if not include_hypothesis:
       df = df.drop(columns=['hypothesis'], errors='ignore')
     if not include_name:
       df = df.drop(columns=['name'], errors='ignore')
 
     # TODO: the lower the better in some cases.
-    df_html = df.style.background_gradient().set_table_styles([
+    df_styler = df.style.background_gradient().set_table_styles([
         {
             "selector": "td, th",
             "props": list({
@@ -1069,18 +1214,33 @@ class Experiment(Iterable[Hypothesis]):
                 "word-break": "keep-all",
             }.items()),
         },
-    ]).to_html()  # yapf: disable
+    ])  # yapf: disable
 
-    if not df_html:
+    if not df_styler:
       return None
+
+    # Add tooltip for individual run information (path)
+    ttips = pd.DataFrame(index=df.index, columns=df.columns)
+    for i, h in enumerate(hypotheses):
+      h = cast(Hypothesis, h)
+      h_summary: pd.DataFrame = h.summary(individual_runs=True)
+      for j, column in enumerate(df.columns):
+        if column in h_summary:
+          ttips.iloc[i, j] = r'\A'.join(
+              f' {r_val:.6g} ::: {r.path}' \
+              for r, r_val in zip(h.runs, h_summary[column])
+          )
+
+    df_styler = df_styler.set_tooltips(ttips)
 
     return ''.join([
         '<div>',
-        '<style scoped>.experiment-name { '
-        '    font-weight: bold; font-size: 14pt; '
-        '}</style>',
+        '''<style scoped>
+          .experiment-name { font-weight: bold; font-size: 14pt; }
+          .pd-t { background-color: #ffe066 !important; color: black !important; padding: 2px; white-space: pre; }
+        </style>''',
         f'<div class="experiment-name">{self.name}</div>',
-        df_html,
+        df_styler.to_html(),
         '</div>',
     ])
 
@@ -1090,15 +1250,15 @@ class Experiment(Iterable[Hypothesis]):
   @overload
   def __getitem__(self, key: int) -> Hypothesis: ...
   @overload
-  def __getitem__(self, key: Union[Tuple, List, np.ndarray]) -> np.ndarray: ...
+  def __getitem__(self, key: Tuple | List | np.ndarray) -> np.ndarray: ...
   @overload
   def __getitem__(self, key: Tuple) -> pd.DataFrame: ...
   # yapf: enable
 
   def __getitem__(
       self,
-      key: Union[int, str, Tuple, List, np.ndarray],
-  ) -> Union[Hypothesis, np.ndarray, Run, pd.DataFrame]:
+      key: int | str | Tuple | List | np.ndarray,
+  ) -> Hypothesis | np.ndarray | Run | pd.DataFrame:
     """Return self[key].
 
     `key` can be one of the following:
@@ -1157,11 +1317,22 @@ class Experiment(Iterable[Hypothesis]):
     return (lambda series: series.rolling(max(1, int(len(series) * portion))
                                           ).mean().iloc[-1])  # yapf: disable
 
-  def summary(self, *, name=True, columns=None, aggregate=None) -> pd.DataFrame:
+  def summary(
+      self,
+      *,
+      name=True,
+      individual_runs: bool = False,
+      columns: Sequence[str] | None = None,
+      aggregate=None,
+  ) -> pd.DataFrame:
     """Return a DataFrame that summarizes the current experiments,
     whose rows are all hypothesis.
 
     Args:
+      name: If True, include the column 'name'. Otherwise include 'hypothesis'.
+      individual_runs: If True, show the summary of metrics for each of the
+        individual runs. If False (default), show the summary of aggregated,
+        averaged hypothesis.
       columns: The list of columns to show. Defaults to `self.columns` plus
         `"index"` (or `df.index.name` if exists).
       aggregate: A function or a dict of functions ({column_name: ...})
@@ -1175,18 +1346,37 @@ class Experiment(Iterable[Hypothesis]):
       >>> df.style.background_gradient(cmap='viridis')
 
     """
+
+    def _entries():
+      if individual_runs:
+        for h in self.hypotheses:
+          yield from h.runs
+      else:
+        yield from self.hypotheses
+
+    entries: List[Run | Hypothesis] = list(_entries())
+
     if name:
-      df = pd.DataFrame({'name': [h.name for h in self.hypotheses]})
+      df = pd.DataFrame({'name': [h.name for h in entries]})
     else:
-      df = pd.DataFrame({'hypothesis': self.hypotheses})
-    hypo_means = [
-        (h.mean() if not all(len(df) == 0
-                             for df in h._dataframes) else pd.DataFrame())
-        for h in self.hypotheses
+      col = 'runs' if individual_runs else 'hypothesis'
+      df = pd.DataFrame({'hypothesis': entries})
+
+    def _mean(h) -> pd.DataFrame:
+      if isinstance(h, Hypothesis):
+        return h.mean()
+      else:
+        return h.df
+
+    rows: List[pd.DataFrame] = [
+        (_mean(h) if not all(len(df) == 0 for df in h._dataframes) \
+                  else pd.DataFrame())
+        for h in entries
     ]
 
-    index_name = (util.ensure_unique({h.index.name for h in hypo_means})
-                  or 'index')  # yapf: disable  # noqa: W503
+    index_name: str = (
+        util.ensure_unique({cast(str, h.index.name) for h in rows})
+        or 'index')  # yapf: disable  # noqa: W503
 
     if columns is None:
       if index_name not in self.columns:
@@ -1213,6 +1403,8 @@ class Experiment(Iterable[Hypothesis]):
         if len(series) == 0:
           # after dropna, no numeric types to aggregate?
           return np.nan
+        if series.dtype.kind == 'O':  # object, not a numeric type
+          return np.nan
         aggregate_fn = aggregate
         if not callable(aggregate_fn):
           aggregate_fn = aggregate[column]  # type: ignore
@@ -1221,7 +1413,7 @@ class Experiment(Iterable[Hypothesis]):
 
       return pd.Series(
           name=column,
-          data=[aggregate_h(df_series(hm)) for hm in hypo_means],
+          data=[aggregate_h(df_series(hm)) for hm in rows],
       )
 
     df = pd.concat(
@@ -1233,12 +1425,61 @@ class Experiment(Iterable[Hypothesis]):
         f"The columns of summary DataFrame must be unique. Found: {df.columns}")
     return df
 
+  @typechecked
+  def with_config_keys(
+      self,
+      new_config_keys: Sequence[Union[str, EllipsisType]],  # type: ignore
+  ) -> Experiment:
+    """Create a new Experiment with the same set of Hypotheses, but a different
+    config keys in the multi-index (usually reordering).
+
+    Note that the underlying hypothesis objects in the new Experiment object
+    won't change, e.g., their name, config, etc. would remain the same.
+
+    Args:
+      new_config_keys: The new list of config keys. This can contain `...`
+        (Ellipsis) as the last element, which refers to all the other keys
+        in the current Experiment that was not included in the list.
+    """
+
+    if new_config_keys[-1] is ...:
+      keys_requested = [x for x in new_config_keys if x is not ...]
+      keys_appended = [x for x in self._config_keys if x not in keys_requested]
+      new_config_keys = keys_requested + keys_appended
+
+    for key in new_config_keys:
+      if not isinstance(key, str):
+        raise TypeError(f"Invalid config key: {type(key)}")
+      for h in self._hypotheses.values():
+        if h.config is None:
+          raise ValueError(f"{h} does not have a config.")
+        if key not in h.config.keys():
+          raise ValueError(f"'{key}' not found in the config of {h}. "
+                           "Close matches: " +
+                           str(difflib.get_close_matches(key, h.config.keys())))
+
+    return self._replace(config_keys=new_config_keys)
+
+  def resample(self, *, n_samples: int) -> Experiment:
+    """Resample data uniformly (equidistantly) for each of the hypotheses,
+    and return a copy of new Experiment objet.
+
+    See: Hypothesis.resample().
+    """
+    return Experiment(
+        name=self.name,
+        hypotheses=[h.resample(n_samples=n_samples) for h in self.hypotheses],
+        config_keys=self._config_keys,
+        summary_columns=self._summary_columns,
+    )
+
   def interpolate(self,
                   x_column: Optional[str] = None,
                   *,
-                  n_samples: int) -> 'Experiment':
-    """Apply interpolation to each of the hypothesis, and return a copy
-    of new Experiment (and its children Hypothesis/Run) object.
+                  n_samples: int) -> Experiment:
+    """Apply resampling and interpolation to each of the hypothesis,
+    and return a copy of new Experiment (with its children Hypothesis/Run)
+    object.
 
     See: Hypothesis.interpolate().
     """
@@ -1252,7 +1493,7 @@ class Experiment(Iterable[Hypothesis]):
         summary_columns=self._summary_columns,
     )
 
-  def apply(self, fn: Callable[[pd.DataFrame], pd.DataFrame]) -> 'Experiment':
+  def apply(self, fn: Callable[[pd.DataFrame], pd.DataFrame]) -> Experiment:
     """Apply a transformation on all underlying DataFrames.
 
     This returns a copy of Experiment and children Hypothesis objects.
@@ -1268,7 +1509,7 @@ class Experiment(Iterable[Hypothesis]):
     plot = None
     for i, (name, hypo) in enumerate(self._hypotheses.items()):
       p = hypo.hvplot(*args, label=name, **kwargs)
-      plot = (plot * p) if plot else p
+      plot = (plot * p) if plot else p  # type: ignore
     return plot
 
   if TYPE_CHECKING:  # Provide type hint and documentation for static checker.

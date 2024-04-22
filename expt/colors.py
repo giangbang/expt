@@ -8,7 +8,13 @@ _thismodule = sys.modules[__name__]
 # https://matplotlib.org/examples/color/named_colors.html
 from matplotlib import colors as mcolors
 
-_colors = dict(mcolors.BASE_COLORS, **mcolors.CSS4_COLORS)
+_colors = {}
+_colors.update(mcolors.BASE_COLORS)
+_colors.update(mcolors.CSS4_COLORS)
+_colors.update({
+    k.replace(':', '_'): v  # e.g., tab:blue -> tab_blue
+    for k, v in mcolors.TABLEAU_COLORS.items()
+})
 
 for color_name in _colors:
   setattr(_thismodule, color_name, color_name)
@@ -16,9 +22,23 @@ for color_name in _colors:
 del sys
 del _thismodule
 
+# Matplotlib default cycle
+MatplotlibDefault = (
+    '#1f77b4',
+    '#ff7f0e',
+    '#2ca02c',
+    '#d62728',
+    '#9467bd',
+    '#8c564b',
+    '#e377c2',
+    '#7f7f7f',
+    '#bcbd22',
+    '#17becf',
+)
+
 # Sensible default color sets that are more distinguishable: 17 colors
 # https://matplotlib.org/3.1.0/gallery/color/named_colors.html
-DefaultColors = (
+ExptSensible17 = (
     'dimgray',
     'dodgerblue',
     'limegreen',

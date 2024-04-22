@@ -1,5 +1,7 @@
 """Plotting behavior (matplotlib, hvplot, etc.) for expt.data"""
 
+from __future__ import annotations
+
 import difflib
 import itertools
 from typing import (Any, Callable, cast, Dict, Iterable, List, Optional,
@@ -8,6 +10,7 @@ import warnings
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+import matplotlib.legend
 import matplotlib.ticker
 import numpy as np
 import pandas as pd
@@ -204,6 +207,9 @@ class GridPlot:
       labels: If given, this will override label names.
       kwargs: Additional kwargs passed to ax.legend().
           e.g., ncol=4
+
+    Returns:
+      The matplotlib legend object added.
     """
     target: Union[Figure, Axes]
     if ax is None:
@@ -218,19 +224,21 @@ class GridPlot:
       else:
         target = ax
 
+    # TODO: Customize how to sort legend items.
     legend_handles, legend_labels = zip(
-        *[(h, l) for (l, h) in sorted(self._collect_legend().items())])
+        *[(h, label) for (label, h) in sorted(self._collect_legend().items())])
     if labels is not None:
       if len(labels) != len(legend_labels):
         raise ValueError(
             f"labels {labels} should have length {len(legend_labels)} "
             f"but was given {len(labels)}")
       legend_labels = list(labels)
-    target.legend(legend_handles, legend_labels, loc=loc, **kwargs)
+    legend = target.legend(legend_handles, legend_labels, loc=loc, **kwargs)
 
     if isinstance(target, Axes) and not target.lines:
       target.axis('off')
-    return self
+
+    return legend
 
   def _collect_legend(self) -> Dict[str, Any]:
     """Collect all legend labels from the subplot axes."""
@@ -246,6 +254,7 @@ class GridPlot:
 
 
 class HypothesisPlotter:
+  """Implements expt.data.Hypothesis.plot()."""
 
   def __init__(self, hypothesis: Hypothesis):  # type: ignore
     self._parent = hypothesis
@@ -275,19 +284,20 @@ class HypothesisPlotter:
                *args,
                subplots=True,
                err_style="runs",
-               err_fn: Optional[HypothesisSummaryFn] = None,
-               representative_fn: Optional[HypothesisSummaryErrFn] = None,
+               err_fn: Optional[HypothesisSummaryErrFn] = None,
+               representative_fn: Optional[HypothesisSummaryFn] = None,
                std_alpha=0.2,
                runs_alpha=0.2,
                n_samples=None,
-               rolling=None,
+               rolling: Union[int, dict, None] = None,
                ignore_unknown: bool = False,
                legend: Union[bool, int, str, Dict[str, Any]] = False,
                prettify_labels: bool = False,
                suptitle: Optional[str] = None,
                grid: Optional[GridPlot] = None,
                ax: Optional[Union[Axes, np.ndarray]] = None,
-               tight_layout: bool = True,
+               tight_layout: Union[bool, Dict[str, Any]] = True,
+               rasterized: bool = False,
                **kwargs) -> GridPlot:
     '''Hypothesis.plot based on matplotlib.
 
@@ -296,7 +306,11 @@ class HypothesisPlotter:
     (2) Plot (several or all) columns in a single axesplot (subplots=False)
 
     Additional keyword arguments:
-      - rolling (int): A window size for rolling and smoothing.
+      - rolling (int, dict, or None): If given (i.e. not None), use a rolling
+        window for smoothing. By default the rolling window is centered. The
+        integer value can represent the window size for rolling and smoothing.
+        If it's a dict, it will be kwargs to the DataFrame.rolling();
+        e.g. rolling = {"center": True, "window": 10}
       - n_samples (int): If given, we subsample using n_samples number of
           equidistant points over the x axis. Values will be interpolated.
       - legend (bool, int, str, or dict):
@@ -348,6 +362,12 @@ class HypothesisPlotter:
           Note that this is mutually exclusive with `grid`.
       - grid (GridPlot): A `GridPlot` instance (optional) to use for
           matplotlib figure and axes. If this is given, `ax` must be None.
+      - tight_layout (bool | dict): Applies to Figure. see fig.tight_layout()
+      - rasterized (bool): Applies to Figure. If true, rasterize vector
+          graphics into raster images, when drawing the plot to produce smaller
+          file size when the number of data points is large (e.g., >= 10K),
+          which could be loaded much faster when saved as a PDF image (savefig).
+          Highly recommend to use fig.set_dpi(...) for a good image quality.
 
     All other kwargs is passed to DataFrame.plot(). For example, you may
     find the following parameters useful:
@@ -364,16 +384,22 @@ class HypothesisPlotter:
       # nothing to draw (no rows)
       raise ValueError("No data to plot, all runs have empty DataFrame.")
 
+    #
+    ## STEP 1. Prepare data (mean ± std)
+    #
+
     def _representative_and_err(h: Hypothesis) -> Tuple[
         pd.DataFrame,  # representative (mean)
         Tuple[pd.DataFrame, pd.DataFrame]  # error band range (stderr)
     ]:  # yapf: disable
       """Evaluate representative_fn and err_fn."""
 
-      representative = representative_fn(h) if representative_fn \
-                       else h.grouped.mean()
+      representative: pd.DataFrame = (
+          representative_fn(h) if representative_fn \
+          else cast(pd.DataFrame, h.mean(numeric_only=True))
+      )
       err_range: Tuple[pd.DataFrame, pd.DataFrame]
-      std = err_fn(h) if err_fn else h.grouped.std()
+      std = err_fn(h) if err_fn else h.std(numeric_only=True)
 
       # Condition check: when representative_fn is given,
       # err_fn should return a range (i.e., tuple)
@@ -386,7 +412,7 @@ class HypothesisPlotter:
             f"err_fn returned: {std}")
 
       if isinstance(std, pd.DataFrame):
-        mean = h.grouped.mean()
+        mean = h.mean(numeric_only=True)
         err_range = (mean - std, mean + std)
         return representative, err_range
 
@@ -401,9 +427,9 @@ class HypothesisPlotter:
                        f"got {type(std)}")
 
     NULL = pd.DataFrame()
-    representative = NULL
-    err = (NULL, NULL)
-    _h_interpolated = None
+    representative: pd.DataFrame = NULL
+    err: Tuple[pd.DataFrame, pd.DataFrame] = (NULL, NULL)
+    _h_interpolated: Optional[Hypothesis] = None
 
     if 'x' not in kwargs:
       # index (same across runs) being x value, so we can simply average
@@ -412,7 +438,7 @@ class HypothesisPlotter:
       # might have different x values --- we need to interpolate.
       # (i) check if the x-column is consistent?
       x = kwargs['x']
-      if n_samples is None and np.any(self._parent.grouped.nunique()[x] > 1):
+      if n_samples is None and np.any(self._parent.grouped[x].nunique() > 1):
         warnings.warn(
             f"The x value (column `{x}`) is not consistent "
             "over different runs. Automatically falling back to the "
@@ -438,18 +464,18 @@ class HypothesisPlotter:
       raise TypeError("representative_fn should return a pd.DataFrame, "
                       f"but got {type(err)}")
 
-    # there might be many NaN values if each column is being logged
-    # at a different period. We fill in the missing values.
-    representative = representative.interpolate()
-    assert representative is not None
-    err = (err[0].interpolate(), err[1].interpolate())
-    assert err[0] is not None and err[1] is not None
+    #
+    ## STEP 2. Determine y columns
+    #
 
     # determine which columns to draw (i.e. y) before smoothing.
     # should only include numerical values
-    y: Iterable[str] = kwargs.get('y', representative.columns)
+    _use_default_y: bool = 'y' not in kwargs
+    y: List[str] = kwargs.get('y', representative.columns)
     if isinstance(y, str):
       y = [y]
+    y = list(y)
+    # Always exclude the x-axis (if non-index)
     if 'x' in kwargs:
       y = [yi for yi in y if yi != kwargs['x']]
 
@@ -457,21 +483,31 @@ class HypothesisPlotter:
       raise TypeError("`y` contains one or more non-str argument(s).")
 
     if ignore_unknown:
-      # TODO(remove): this is hack to handle homogeneous column names
-      # over different hypotheses in a single of experiment, because it
-      # will end up adding dummy columns instead of ignoring unknowns.
+      # Add extra columns even if do not exist in the dataframe, if y is given.
+      # This is a hack to handle non-homogeneous column names in a single
+      # Experiment. see test_gridplot_basic() for a scenario.
       extra_y = set(y) - set(representative.columns)
       for yi in extra_y:
         representative[yi] = np.nan
+        err[0][yi] = np.nan
+        err[1][yi] = np.nan
 
     def _should_include_column(col_name: str) -> bool:
       if not col_name:  # empty name
         return False
 
+      # include only numeric values (integer or float).
+      # (check from the originial hypothesis dataframe, not from representative)
+      for df in self._dataframes:
+        if col_name in df and df[col_name].dtype.kind not in ('i', 'f'):
+          if not _use_default_y:
+            raise ValueError(f"Invalid y: the column `{col_name}` "
+                             f"has a non-numeric type: {df[col_name].dtype}.")
+          return False
+
       # unknown column in the DataFrame
-      assert representative is not None
-      dtypes = representative.dtypes.to_dict()  # type: ignore
-      if col_name not in dtypes:
+      # Note that additional extra_y columns are also accepted
+      if col_name not in representative.columns:
         if ignore_unknown:
           return False  # just ignore, no error
         else:
@@ -480,22 +516,43 @@ class HypothesisPlotter:
               f"Available columns: {list(representative.columns)}; " +
               "Use ignore_unknown=True to ignore unknown columns.")
 
-      # include only numeric values (integer or float)
-      if not (dtypes[col_name].kind in ('i', 'f')):
-        return False
       return True
 
+    # Exclude non-numeric types that cannot be plotted or interpolated
     y = [yi for yi in y if _should_include_column(yi)]
+    _columns_to_keep = [*y]
+    if 'x' in kwargs:
+      _columns_to_keep.append(kwargs['x'])
+    representative = cast(pd.DataFrame, representative[_columns_to_keep])
+    err = (
+        cast(pd.DataFrame, err[0][_columns_to_keep]),
+        cast(pd.DataFrame, err[1][_columns_to_keep]),
+    )
+
+    #
+    ## STEP 3. Processing of data, such as interpolation and smoothing
+    #
+
+    # There might be many NaN values if each column is being logged
+    # at a different period. We fill in the missing values.
+    representative = util.ensure_notNone(representative.interpolate())
+    assert representative is not None
+    err = (util.ensure_notNone(err[0].interpolate()),
+           util.ensure_notNone(err[1].interpolate()))
 
     if rolling:
-      representative = representative.rolling(
-          rolling, min_periods=1, center=True).mean()
-      err = (err[0].rolling(rolling, min_periods=1, center=True).mean(),
-             err[1].rolling(rolling, min_periods=1, center=True).mean())
+      rolling_kwargs = _rolling_kwargs(rolling)
+      representative = representative.rolling(**rolling_kwargs).mean()
+      err = (err[0].rolling(**rolling_kwargs).mean(),
+             err[1].rolling(**rolling_kwargs).mean())
 
     # suptitle: defaults to hypothesis name if ax/grid was not given
     if suptitle is None and (ax is None and grid is None):
       suptitle = self._parent.name
+
+    # Merge with hypothesis's default style
+    if self._parent.style:
+      kwargs = {**self._parent.style, **kwargs}
 
     return self._do_plot(
         y,
@@ -514,6 +571,7 @@ class HypothesisPlotter:
         grid=grid,
         ax=ax,
         tight_layout=tight_layout,
+        rasterized=rasterized,
         args=args,  # type: ignore
         kwargs=kwargs)  # type: ignore
 
@@ -537,7 +595,7 @@ class HypothesisPlotter:
       _h_interpolated: Optional[Hypothesis] = None,  # type: ignore
       n_samples: Optional[int],
       subplots: bool,
-      rolling: Optional[int],
+      rolling: Union[int, dict, None],
       err_style: Optional[str],
       std_alpha: float,
       runs_alpha: float,
@@ -547,6 +605,7 @@ class HypothesisPlotter:
       grid: Optional[GridPlot] = None,
       ax: Optional[Union[Axes, np.ndarray]] = None,
       tight_layout: Union[bool, Dict[str, Any]] = True,
+      rasterized: bool = False,
       args: List,
       kwargs: Dict,
   ) -> GridPlot:
@@ -610,7 +669,8 @@ class HypothesisPlotter:
     else:
       kwargs['legend'] = bool(legend)
 
-    axes = representative.plot(*args, subplots=subplots, ax=ax, **kwargs)
+    axes = representative.plot(
+        *args, subplots=subplots, ax=ax, rasterized=rasterized, **kwargs)
 
     if err_style not in self.KNOWN_ERR_STYLES:
       raise ValueError(f"Unknown err_style '{err_style}', "
@@ -618,7 +678,9 @@ class HypothesisPlotter:
 
     if err_style in ('band', 'fill'):
       # show shadowed range of 1-std errors
-      for ax, yi in zip(np.asarray(axes).flat, y):
+      for ax, yi in zip(np.asarray(axes).flat, y):  # type: ignore
+        if yi not in err_range[0] or yi not in err_range[1]:
+          continue
         ax = cast(Axes, ax)
         mean_line = ax.get_lines()[-1]
         x = kwargs.get('x', None)
@@ -627,11 +689,13 @@ class HypothesisPlotter:
                         err_range[0][yi].values,
                         err_range[1][yi].values,
                         color=mean_line.get_color(),
-                        alpha=std_alpha)  # yapf: disable
+                        alpha=std_alpha,
+                        rasterized=rasterized,
+                        )  # yapf: disable
 
     elif err_style in ('runs', 'unit_traces') and len(self.runs) > 1:
       # show individual runs
-      for ax, yi in zip(np.asarray(axes).flat, y):
+      for ax, yi in zip(np.asarray(axes).flat, y):  # type: ignore
         ax = cast(Axes, ax)
         x = kwargs.get('x', None)
         color = ax.get_lines()[-1].get_color()
@@ -645,10 +709,13 @@ class HypothesisPlotter:
           if yi not in df:
             continue
           if rolling:
-            df = df.rolling(rolling, min_periods=1,
-                            center=True).mean()  # yapf: disable
-          df.plot(ax=ax, x=x, y=yi, legend=False, label='',
-                  color=color, alpha=runs_alpha)  # yapf: disable
+            df = df.rolling(**_rolling_kwargs(rolling)).mean()
+
+          # Note: the series may have nan (missing) values.
+          df_yi = df[[x, yi]] if x is not None else df[yi]
+          cast(pd.DataFrame, df_yi).dropna().plot(
+              ax=ax, x=x, legend=False, label='',
+              color=color, alpha=runs_alpha)  # yapf: disable
 
     # some sensible styling (grid, tight_layout) AFTER calling plot()
     # Note: 'kwargs[grid]' is for axes and 'grid' means GridPlot
@@ -705,6 +772,7 @@ class HypothesisHvPlotter(HypothesisPlotter):
       ax=None,
       grid=None,
       tight_layout: bool = True,
+      rasterized: bool = True,
       args: List,
       kwargs: Dict,
   ):
@@ -808,7 +876,7 @@ class LegendSpec(dict):
   __setitem__ = __delitem__ = pop = popitem = _immutable
   clear = setdefault = _immutable  # type: ignore
 
-  def __call__(self, **kwargs) -> 'LegendSpec':
+  def __call__(self, **kwargs) -> LegendSpec:
     # Return an updated copy if it is called.
     return LegendSpec({**self, **kwargs})
 
@@ -917,7 +985,8 @@ class ExperimentPlotter:
         y = [yi for yi in y if yi != kwargs['x']]
       kwargs['y'] = y
 
-    # Line style for each hypothesis.
+    # Assign line style for each hypothesis
+    # TODO: avoid conflicts as much as we can against hypothosis.style
     axes_cycle = matplotlib.rcParams['axes.prop_cycle']()  # type: ignore
     axes_props = list(itertools.islice(axes_cycle, len(self._hypotheses)))
     for key in list(axes_props[0].keys()):
@@ -928,8 +997,8 @@ class ExperimentPlotter:
 
     if 'color' not in axes_props[0].keys():
       # axes.prop_cycle does not have color. Fall back to default colors
-      from .colors import DefaultColors
-      color_it = itertools.cycle(DefaultColors)
+      from .colors import ExptSensible17
+      color_it = itertools.cycle(ExptSensible17)
       for prop, c in zip(axes_props, color_it):
         prop['color'] = c
 
@@ -962,22 +1031,29 @@ class ExperimentPlotter:
     given_ax_or_grid = ('ax' in kwargs) or (grid is not None)
 
     for i, (name, hypo) in enumerate(self._hypotheses.items()):
+      h_kwargs = kwargs.copy()
+      if grid is not None:
+        h_kwargs.pop('ax', None)  # i=0: ax, i>0: grid
+
       if isinstance(y, str):
         # display different hypothesis over subplots:
-        kwargs['label'] = hypothesis_labels[i]
-        kwargs['subplots'] = False
+        h_kwargs['label'] = hypothesis_labels[i]
+        h_kwargs['subplots'] = False
         if 'title' not in kwargs:
-          kwargs['title'] = y  # column name
+          h_kwargs['title'] = y  # column name
 
       else:
         # display multiple columns over subplots:
         if y is not None:
-          kwargs['label'] = [f'{y_i} ({name})' for y_i in y]
-          if kwargs.get('prettify_labels', False):
-            kwargs['label'] = util.prettify_labels(kwargs['label'])
-        kwargs['subplots'] = True
+          h_kwargs['label'] = [f'{y_i} ({name})' for y_i in y]
+          if h_kwargs.get('prettify_labels', False):
+            h_kwargs['label'] = util.prettify_labels(h_kwargs['label'])
+        h_kwargs['subplots'] = True
 
-      kwargs.update(axes_props[i])  # e.g. color, linestyle, etc.
+      h_kwargs.update(axes_props[i])  # e.g. color, linestyle, etc.
+
+      # Hypothesis' own style should take more priority
+      h_kwargs.update(hypo.style)
 
       # exclude the hypothesis if it has no runs in it
       if hypo.empty():
@@ -985,14 +1061,14 @@ class ExperimentPlotter:
                       "ignoring it", UserWarning)
         continue
 
-      kwargs['tight_layout'] = False
-      kwargs['ignore_unknown'] = True
-      kwargs['suptitle'] = ''  # no suptitle for each hypo
+      h_kwargs['tight_layout'] = False
+      h_kwargs['ignore_unknown'] = True
+      h_kwargs['suptitle'] = ''  # no suptitle for each hypo
 
-      grid = hypo.plot(*args, grid=grid, **kwargs)  # on the same ax(es)?
+      grid = hypo.plot(*args, grid=grid, **h_kwargs)  # on the same ax(es)?
       assert grid is not None
 
-      kwargs.pop('ax', None)  # From now on, grid.axes will be used
+    assert grid is not None  # True if len(hypothesis) > 0
 
     # corner case: if there is only one column, use it as a label
     if len(grid.axes_active) == 1 and isinstance(y, str):
@@ -1033,6 +1109,16 @@ def _add_suptitle(fig, suptitle, fontsize='x-large', y=1.02, **kwargs):
     raise TypeError("Expected str or dict for suptitle: {}".format(suptitle))
 
 
+def _rolling_kwargs(rolling: Union[int, Dict[str, Any]]) -> Dict[str, Any]:
+  defaults = dict(min_periods=1, center=True)
+  if isinstance(rolling, dict):
+    if 'window' not in rolling:
+      raise ValueError("rolling.window must not be None")
+    return {**defaults, **rolling}
+  else:  # int
+    return {'window': rolling, **defaults}
+
+
 # yapf: disable
 FORMATTER_MEGA = matplotlib.ticker.FuncFormatter(lambda x, pos: '{0:g}M'.format(x / 1e6))
 FORMATTER_KILO = matplotlib.ticker.FuncFormatter(lambda x, pos: '{0:g}K'.format(x / 1e3))
@@ -1054,6 +1140,30 @@ def autoformat_xaxis(ax: Axes, scale: Optional[float] = None):
   if ticks is not None:
     ax.xaxis.set_major_formatter(ticks)
   return ticks
+
+
+def make_legend_fig(legend: matplotlib.legend.Legend) -> Figure:
+  """Create a new matplotlib figure that contains a copy of the legend."""
+
+  # Get the dimensions (in inches) of the legend's bounding box
+  legend_inches = legend.get_window_extent().transformed(
+      cast(Figure, legend.figure).dpi_scale_trans.inverted())
+
+  fig = Figure(
+      figsize=(
+          legend_inches.width + 0.05,
+          legend_inches.height + 0.05,
+      ))
+  fig.add_axes([0, 0, 1, 1]).axis('off')
+
+  fig.legend(
+      legend.legendHandles,
+      [t.get_text() for t in legend.texts],
+      ncol=legend._ncols,
+      loc='center',
+      bbox_to_anchor=(0.5, 0.5),
+  )
+  return fig
 
 
 HypothesisPlotter.__doc__ = HypothesisPlotter.__call__.__doc__

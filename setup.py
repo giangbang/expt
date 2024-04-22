@@ -1,20 +1,24 @@
 """setup.py for expt"""
 
 import ast
-from distutils.errors import DistutilsPlatformError
 import os
-import re
 import shutil
 import sys
 import textwrap
+import warnings
+
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module='setuptools',
+    message="setuptools.installer and fetch_build_eggs are deprecated."
+) # yapf: disable
 
 from setuptools import Command
 from setuptools import setup
 
 try:
   from setuptools_rust import Binding
-  from setuptools_rust import RustExtension
   from setuptools_rust import build_rust
+  from setuptools_rust import RustExtension
   from setuptools_rust.command import get_rust_version
 except ImportError:
   sys.stderr.write(textwrap.dedent(
@@ -35,6 +39,7 @@ class build_rust_for_expt(build_rust):
 
   def run(self):
     if not EXPT_DISABLE_RUST and get_rust_version() is None:
+      from distutils.errors import DistutilsPlatformError
       raise DistutilsPlatformError(
           "Rust toolchain (cargo, rustc) not found. "
           "Please install rust toolchain to build expt with the rust extension. "
@@ -44,78 +49,24 @@ class build_rust_for_expt(build_rust):
 
 
 def read_readme():
-  with open('README.md') as f:
+  with open('README.md', encoding='utf-8') as f:
     return f.read()
 
 
-def read_version():
-  __PATH__ = os.path.abspath(os.path.dirname(__file__))
-  with open(os.path.join(__PATH__, 'expt/__init__.py')) as f:
-    version_match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]",
-                              f.read(), re.M)  # yapf: disable
-  if version_match:
-    return version_match.group(1)
-  raise RuntimeError("Unable to find __version__ string")
-
-
-__version__ = read_version()
-
-
-# brought from https://github.com/kennethreitz/setup.py
-class DeployCommand(Command):
-  description = 'Build and deploy the package to PyPI.'
-  user_options = []
-
-  def initialize_options(self):
-    pass
-
-  def finalize_options(self):
-    pass
-
-  @staticmethod
-  def status(s):
-    print(s)
-
-  def run(self):
-    import twine  # we require twine locally  # noqa
-
-    assert 'dev' not in __version__, ("Only non-devel versions are allowed. "
-                                      "__version__ == {}".format(__version__))
-
-    with os.popen("git status --short") as fp:
-      git_status = fp.read().strip()
-      if git_status:
-        print("Error: git repository is not clean.\n")
-        os.system("git status --short")
-        sys.exit(1)
-
-    try:
-      from shutil import rmtree
-      self.status('Removing previous builds ...')
-      rmtree(os.path.join(__PATH__, 'dist'))
-    except OSError:
-      pass
-
-    self.status('Building Source and Wheel (universal) distribution ...')
-    os.system('{0} setup.py sdist'.format(sys.executable))
-
-    self.status('Uploading the package to PyPI via Twine ...')
-    ret = os.system('twine upload dist/*')
-    if ret != 0:
-      sys.exit(ret)
-
-    self.status('Creating git tags ...')
-    os.system('git tag v{0}'.format(__version__))
-    os.system('git tag --list')
-    sys.exit()
-
+try:
+  import setuptools_scm
+except ImportError as ex:
+  raise ImportError("setuptools_scm not found. When running setup.py directly, "
+                    "setuptools_scm>=8.0 needs to be installed manually. "
+                    "Or consider running `pip install -e .` instead.") from ex
 
 install_requires = [
     'numpy>=1.16.5',
     'scipy',
     'typeguard>=2.6.1',
     'matplotlib>=3.0.0',
-    'pandas>=1.0',
+    'pandas>=1.3',
+    'pyyaml>=6.0',
     'multiprocess>=0.70.12',
     'multiprocessing_utils==0.4',
     'typing_extensions>=4.0',
@@ -129,13 +80,33 @@ tests_requires = [
     'pytest-asyncio',
     # Optional dependencies.
     'tensorboard>=2.3',
-    'fabric~=2.6',
+    'fabric>=3.0',
     'paramiko>=2.8',
 ]
 
+
+def next_semver(version: setuptools_scm.version.ScmVersion):
+  """Determine next development version."""
+
+  if version.branch and 'release' in version.branch:
+    # Release branch: bump up patch versions
+    return version.format_next_version(
+        setuptools_scm.version.guess_next_simple_semver,
+        retain=setuptools_scm.version.SEMVER_PATCH)
+  else:
+    # main/dev branch: bump up minor versions
+    return version.format_next_version(
+        setuptools_scm.version.guess_next_simple_semver,
+        retain=setuptools_scm.version.SEMVER_MINOR)
+
+
 setup(
     name='expt',
-    version=__version__,
+    # version=__version__,  # setuptools_scm sets version automatically
+    use_scm_version=dict(
+        write_to='expt/_version.py',
+        version_scheme=next_semver,
+    ),
     license='MIT',
     description='EXperiment. Plot. Tabulate.',
     long_description=read_readme(),
@@ -149,14 +120,15 @@ setup(
         'Development Status :: 3 - Alpha',
         'License :: OSI Approved :: MIT License',
         'Operating System :: POSIX :: Linux',
-        'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
         'Topic :: Utilities',
         'Topic :: Scientific/Engineering',
     ],
+    python_requires='>=3.8',
     packages=['expt'],
     rust_extensions=[
         RustExtension("expt._internal", binding=Binding.PyO3, \
@@ -171,10 +143,8 @@ setup(
         #'console_scripts': ['expt=expt:main'],
     },
     cmdclass={
-        'deploy': DeployCommand,
         'build_rust': build_rust_for_expt,
     },  # type: ignore
     include_package_data=True,
     zip_safe=False,
-    python_requires='>=3.7',
 )
