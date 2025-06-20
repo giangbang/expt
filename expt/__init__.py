@@ -6,17 +6,17 @@
 import sys
 
 if sys.version_info < (3, 8):
-  raise RuntimeError("This library requires python 3.8+.")
+    raise RuntimeError("This library requires python 3.8+.")
 
-try:
-  from ._version import version as __version__
-  from ._version import version_tuple as __version_tuple__
-except (ImportError, AttributeError) as ex:
-  raise ImportError(
-      "Unable to find the `expt.__version__` string. "
-      "Please try reinstalling expt; "
-      "or if you are on a development version, run `pip install -e .` or "
-      "`python setup.py --version` and try again.") from ex
+# try:
+#   from ._version import version as __version__
+#   from ._version import version_tuple as __version_tuple__
+# except (ImportError, AttributeError) as ex:
+#   raise ImportError(
+#       "Unable to find the `expt.__version__` string. "
+#       "Please try reinstalling expt; "
+#       "or if you are on a development version, run `pip install -e .` or "
+#       "`python setup.py --version` and try again.") from ex
 
 # auto-import submodules
 from . import colors as colors
