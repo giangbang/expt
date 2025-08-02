@@ -771,7 +771,8 @@ class Hypothesis(Iterable[Run]):
           if idx_valid.sum() >= 2:
             return scipy.interpolate.interp1d(df.index[idx_valid],
                                               y_series[idx_valid],
-                                              bounds_error=False)(x_samples)
+                                              bounds_error=False,
+                                              fill_value="extrapolate")(x_samples)
           else:
             # Insufficient data due to a empty/crashed run.
             # Ignore the corner case! TODO: Add warning message.
