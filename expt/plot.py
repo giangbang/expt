@@ -975,6 +975,7 @@ class ExperimentPlotter:
       grid=None,
       colors=None,
       linestyles=None,
+      zorders=None, 
       tight_layout: Union[bool, Dict[str, Any]] = True,
       **kwargs,
   ) -> GridPlot:
@@ -1053,6 +1054,36 @@ class ExperimentPlotter:
         for (name, _), prop in zip(self._hypotheses.items(), axes_props):
           if name in colors:
             prop['color'] = colors[name]
+    
+    if zorders is not None:
+
+      if isinstance(zorders, (list, tuple)):
+        if len(zorders) != len(self._hypotheses):
+          raise ValueError(
+            "`zorders` should have the same number of elements as "
+            f"Hypotheses ({len(self._hypotheses)}), "
+            f"but the given length is {len(zorders)}."
+          )
+
+        for prop, z in zip(axes_props, zorders):
+          prop["zorder"] = z
+
+      elif isinstance(zorders, dict):
+        unknown = set(zorders) - set(self._hypotheses)
+
+        if unknown:
+          raise ValueError(
+            f"Unknown hypothesis names in zorders: {unknown}"
+          )
+
+        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
+          if name in zorders:
+            prop["zorder"] = zorders[name]
+
+      else:
+        raise TypeError(
+          "`zorders` must be a list, tuple, or dict."
+        )
 
     if linestyles is not None:
       if len(linestyles) != len(self._hypotheses):
