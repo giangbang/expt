@@ -194,6 +194,7 @@ class GridPlot:
                  ax: Optional[Union[Axes, str, int]] = None,
                  loc=None,
                  labels: Optional[Sequence[str]] = None,
+                 order: Optional[Sequence[str]] =None,
                  **kwargs):
     """Put a legend for all objects aggregated over the axes.
 
@@ -205,6 +206,8 @@ class GridPlot:
     Args:
       loc: str or pair of floats (see matplotlib.pyplot.legend)
       labels: If given, this will override label names.
+      order: If given, this will specify the order of legend entries. 
+          By default, legends are sorted alphabetically.
       kwargs: Additional kwargs passed to ax.legend().
           e.g., ncol=4
 
@@ -224,9 +227,29 @@ class GridPlot:
       else:
         target = ax
 
-    # TODO: Customize how to sort legend items.
+    legend_dict = self._collect_legend()
+
+    if order is None:
+      items = sorted(legend_dict.items())
+    else:
+      if len(order) != len(legend_dict):
+        raise ValueError(
+          f"order has length {len(order)} but "
+          f"{len(legend_dict)} legend entries were found"
+        )
+
+      missing = set(order) - set(legend_dict)
+      if missing:
+        raise ValueError(
+          f"Unknown legend labels in order: {missing}"
+        )
+
+      items = [(label, legend_dict[label]) for label in order]
+
     legend_handles, legend_labels = zip(
-        *[(h, label) for (label, h) in sorted(self._collect_legend().items())])
+        *[(handle, label) for label, handle in items]
+    )
+    
     if labels is not None:
       if len(labels) != len(legend_labels):
         raise ValueError(
@@ -945,6 +968,7 @@ class ExperimentPlotter:
                     LegendSpec] = LegendPreset.AUTO,
       grid=None,
       colors=None,
+      linestyles=None,
       tight_layout: Union[bool, Dict[str, Any]] = True,
       **kwargs,
   ) -> GridPlot:
@@ -973,6 +997,8 @@ class ExperimentPlotter:
           the argument value given a list of labels.
         - (See also) ex.plot.LegendPreset for some common presets.
       colors: Iterable[Str]
+      linestyles: Iterable[Str] or Dict[str, Str]
+       tight_layout: bool or dict, passed to fig.tight_layout().
     '''
     # Prepare kwargs for Hypothesis.plot().
 
@@ -1005,10 +1031,32 @@ class ExperimentPlotter:
     if colors is not None:
       if len(colors) != len(self._hypotheses):
         raise ValueError("`colors` should have the same number of elements as "
-                         "Hypotheses ({}), but the given length is {}.".format(
-                             len(self._hypotheses), len(colors)))
-      for prop, given_color in zip(axes_props, colors):
-        prop['color'] = given_color
+                        "Hypotheses ({}), but the given length is {}.".format(
+                        len(self._hypotheses), len(colors)))
+      if isinstance(colors, (list, tuple)):
+        for prop, given_color in zip(axes_props, colors):
+          prop['color'] = given_color
+      elif isinstance(colors, dict):
+        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
+          if name in colors:
+            prop['color'] = colors[name]
+
+    if linestyles is not None:
+      if len(linestyles) != len(self._hypotheses):
+        raise ValueError(
+          "`linestyles` should have the same number "
+          "of elements as hypotheses "
+          f"({len(self._hypotheses)}), "
+          f"but got {len(linestyles)}."
+        )
+
+      if isinstance(linestyles, (list, tuple)):
+        for prop, ls in zip(axes_props, linestyles):
+          prop["linestyle"] = ls
+      elif isinstance(linestyles, dict):
+        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
+          if name in linestyles:
+            prop["linestyle"] = linestyles[name]
 
     hypothesis_labels = [name for name, _ in self._hypotheses.items()]
     if kwargs.get('prettify_labels', False):
