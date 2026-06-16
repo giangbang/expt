@@ -244,6 +244,12 @@ class GridPlot:
           f"Unknown legend labels in order: {missing}"
         )
 
+      extra = set(legend_dict) - set(order)
+      if extra:
+        raise ValueError(
+          f"Legend labels missing from order: {extra}"
+        )
+
       items = [(label, legend_dict[label]) for label in order]
 
     legend_handles, legend_labels = zip(
@@ -998,7 +1004,7 @@ class ExperimentPlotter:
         - (See also) ex.plot.LegendPreset for some common presets.
       colors: Iterable[Str]
       linestyles: Iterable[Str] or Dict[str, Str]
-       tight_layout: bool or dict, passed to fig.tight_layout().
+      tight_layout: bool or dict, passed to fig.tight_layout().
     '''
     # Prepare kwargs for Hypothesis.plot().
 
@@ -1037,6 +1043,13 @@ class ExperimentPlotter:
         for prop, given_color in zip(axes_props, colors):
           prop['color'] = given_color
       elif isinstance(colors, dict):
+        unknown = set(colors) - set(self._hypotheses)
+
+        if unknown:
+          raise ValueError(
+            f"Unknown hypothesis names in colors: {unknown}"
+          )
+
         for (name, _), prop in zip(self._hypotheses.items(), axes_props):
           if name in colors:
             prop['color'] = colors[name]
