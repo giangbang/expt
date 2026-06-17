@@ -966,6 +966,41 @@ class ExperimentPlotter:
     else:
       return self._parent.columns
 
+  def _apply_style(self, values, prop_name, axes_props, hypotheses):
+    if values is None:
+      return
+
+    n = len(hypotheses)
+
+    if isinstance(values, (list, tuple)):
+      if len(values) != n:
+        raise ValueError(
+          f"`{prop_name}s` should have the same number of elements as "
+          f"Hypotheses ({n}), but the given length is {len(values)}."
+        )
+
+      for prop, value in zip(axes_props, values):
+        prop[prop_name] = value
+
+    elif isinstance(values, dict):
+      unknown = set(values) - set(hypotheses)
+
+      if unknown:
+        raise ValueError(
+          f"Unknown hypothesis names in {prop_name}s: {unknown}, "
+          f"available names are: {set(hypotheses)}."
+        )
+
+      for (name, _), prop in zip(hypotheses.items(), axes_props):
+        if name in values:
+          prop[prop_name] = values[name]
+
+    else:
+      raise TypeError(
+        f"`{prop_name}s` must be a list, tuple, or dict."
+      )
+
+
   def __call__(
       self,
       *args,
@@ -976,6 +1011,7 @@ class ExperimentPlotter:
       colors=None,
       linestyles=None,
       zorders=None, 
+      linewidths=None,
       tight_layout: Union[bool, Dict[str, Any]] = True,
       **kwargs,
   ) -> GridPlot:
@@ -1035,72 +1071,10 @@ class ExperimentPlotter:
       for prop, c in zip(axes_props, color_it):
         prop['color'] = c
 
-    if colors is not None:
-      if len(colors) != len(self._hypotheses):
-        raise ValueError("`colors` should have the same number of elements as "
-                        "Hypotheses ({}), but the given length is {}.".format(
-                        len(self._hypotheses), len(colors)))
-      if isinstance(colors, (list, tuple)):
-        for prop, given_color in zip(axes_props, colors):
-          prop['color'] = given_color
-      elif isinstance(colors, dict):
-        unknown = set(colors) - set(self._hypotheses)
-
-        if unknown:
-          raise ValueError(
-            f"Unknown hypothesis names in colors: {unknown}"
-          )
-
-        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
-          if name in colors:
-            prop['color'] = colors[name]
-    
-    if zorders is not None:
-
-      if isinstance(zorders, (list, tuple)):
-        if len(zorders) != len(self._hypotheses):
-          raise ValueError(
-            "`zorders` should have the same number of elements as "
-            f"Hypotheses ({len(self._hypotheses)}), "
-            f"but the given length is {len(zorders)}."
-          )
-
-        for prop, z in zip(axes_props, zorders):
-          prop["zorder"] = z
-
-      elif isinstance(zorders, dict):
-        unknown = set(zorders) - set(self._hypotheses)
-
-        if unknown:
-          raise ValueError(
-            f"Unknown hypothesis names in zorders: {unknown}"
-          )
-
-        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
-          if name in zorders:
-            prop["zorder"] = zorders[name]
-
-      else:
-        raise TypeError(
-          "`zorders` must be a list, tuple, or dict."
-        )
-
-    if linestyles is not None:
-      if len(linestyles) != len(self._hypotheses):
-        raise ValueError(
-          "`linestyles` should have the same number "
-          "of elements as hypotheses "
-          f"({len(self._hypotheses)}), "
-          f"but got {len(linestyles)}."
-        )
-
-      if isinstance(linestyles, (list, tuple)):
-        for prop, ls in zip(axes_props, linestyles):
-          prop["linestyle"] = ls
-      elif isinstance(linestyles, dict):
-        for (name, _), prop in zip(self._hypotheses.items(), axes_props):
-          if name in linestyles:
-            prop["linestyle"] = linestyles[name]
+    self._apply_style(colors, "color", axes_props, self._hypotheses)
+    self._apply_style(zorders, "zorder", axes_props, self._hypotheses)
+    self._apply_style(linewidths, "linewidth", axes_props, self._hypotheses)
+    self._apply_style(linestyles, "linestyle", axes_props, self._hypotheses)
 
     hypothesis_labels = [name for name, _ in self._hypotheses.items()]
     if kwargs.get('prettify_labels', False):
